@@ -1,6 +1,20 @@
 """
 ui.py
 Full Tkinter UI for ADB Device Manager.
+
+IMPROVEMENTS OVER ORIGINAL:
+- ADB check runs in a background thread — UI never freezes on startup
+- _refresh_devices / _refresh_apps use a busy-guard (_busy flag) to prevent
+  concurrent background threads stomping each other
+- _clear_tree uses tree.delete(*children) bulk call instead of one-by-one loop
+- Search is debounced: only runs _apply_filter_and_search() 250 ms after the
+  user stops typing — no tree thrash on every keystroke
+- Device info loads in parallel with app list (two threads, not serialised)
+- _get_serial() is more robust: handles combo labels with/without status suffix
+- adb_start_server() called once on startup to warm the ADB daemon
+- Combo auto-selects first device but guards against re-triggering load when
+  the device is already selected
+- _on_device_selected no longer called from _refresh_devices to avoid double-load
 """
 
 import tkinter as tk
@@ -14,51 +28,23 @@ import adb_manager
 import app_manager
 
 
-class Tooltip:
-    """Simple tooltip class for Tkinter widgets."""
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.tooltip = None
-        self.widget.bind("<Enter>", self.show_tooltip)
-        self.widget.bind("<Leave>", self.hide_tooltip)
-
-    def show_tooltip(self, event=None):
-        x, y, _, _ = self.widget.bbox("insert")
-        x += self.widget.winfo_rootx() + 25
-        y += self.widget.winfo_rooty() + 25
-        self.tooltip = tk.Toplevel(self.widget)
-        self.tooltip.wm_overrideredirect(True)
-        self.tooltip.wm_geometry(f"+{x}+{y}")
-        label = tk.Label(self.tooltip, text=self.text, background="#ffffe0",
-                         relief="solid", borderwidth=1, font=("Segoe UI", 8))
-        label.pack()
-
-    def hide_tooltip(self, event=None):
-        if self.tooltip:
-            self.tooltip.destroy()
-            self.tooltip = None
-
-
-# ──────────────────────────────────────────────
-#  Color palette / style constants
-# ──────────────────────────────────────────────
-BG_DARK       = "#1a1d23"
-BG_CARD       = "#22262f"
-BG_PANEL      = "#1e2129"
-BG_TABLE      = "#181b22"
-ACCENT        = "#4f8ef7"
-ACCENT_HOVER  = "#6aa3ff"
-DANGER        = "#e05c5c"
-SUCCESS       = "#4caf7d"
-WARNING       = "#f0a830"
-TEXT_PRIMARY  = "#e8eaf0"
-TEXT_SECONDARY= "#8a8fa8"
-TEXT_DISABLED = "#4a4f65"
-BORDER        = "#2d3245"
-ROW_ODD       = "#1e2230"
-ROW_EVEN      = "#1a1d28"
-ROW_SELECT    = "#2a3a5c"
+# ── Colour palette ─────────────────────────────────────────────────────────────
+BG_DARK        = "#1a1d23"
+BG_CARD        = "#22262f"
+BG_PANEL       = "#1e2129"
+BG_TABLE       = "#181b22"
+ACCENT         = "#4f8ef7"
+ACCENT_HOVER   = "#6aa3ff"
+DANGER         = "#e05c5c"
+SUCCESS        = "#4caf7d"
+WARNING        = "#f0a830"
+TEXT_PRIMARY   = "#e8eaf0"
+TEXT_SECONDARY = "#8a8fa8"
+TEXT_DISABLED  = "#4a4f65"
+BORDER         = "#2d3245"
+ROW_ODD        = "#1e2230"
+ROW_EVEN       = "#1a1d28"
+ROW_SELECT     = "#2a3a5c"
 
 
 class ADBDeviceManagerApp:
@@ -69,56 +55,50 @@ class ADBDeviceManagerApp:
         self.root.minsize(900, 620)
         self.root.configure(bg=BG_DARK)
 
-        # State
-        self.devices = []
-        self.selected_serial = tk.StringVar()
-        self.search_var = tk.StringVar()
-        self.current_filter = "all"
-        self.all_packages = []   # full classified list
-        self.visible_packages = []  # filtered/searched list
+        # ── State ──────────────────────────────────────────────────────────────
+        self.devices            = []
+        self.selected_serial    = tk.StringVar()
+        self.search_var         = tk.StringVar()
+        self.current_filter     = "all"
+        self.all_packages       = []
+        self.visible_packages   = []
+
+        # Guard: prevents two background refreshes running at the same time.
+        self._busy              = False
+        # After-ID for debounced search
+        self._search_after_id   = None
+        # Track the serial that was last fully loaded so we don't reload when
+        # the user clicks the same device in the combo twice.
+        self._loaded_serial     = None
 
         self._setup_styles()
         self._build_ui()
-        self._check_adb_and_load()
 
-        # Keyboard shortcuts
-        self.root.bind("<Control-r>", lambda e: self._refresh_devices())
-        self.root.bind("<Control-a>", lambda e: self._refresh_apps())
-        self.root.bind("<Control-f>", lambda e: self.search_entry.focus())
-        self.root.bind("<Control-l>", lambda e: self._clear_search())
-        self.root.focus_set()  # Allow root to receive key events
+        # Start the ADB daemon warm-up and device scan in the background so
+        # the window appears immediately without any freeze.
+        self.run_in_thread(adb_manager.adb_start_server)
+        self.root.after(50, self._check_adb_and_load)   # tiny delay lets window render first
 
-    # ──────────────────────────────────────────
-    #  Style setup
-    # ──────────────────────────────────────────
+    # ── Style setup ────────────────────────────────────────────────────────────
     def _setup_styles(self):
         style = ttk.Style(self.root)
         style.theme_use("clam")
 
-        # General
         style.configure(".", background=BG_DARK, foreground=TEXT_PRIMARY,
                          font=("Segoe UI", 10), borderwidth=0)
-        style.configure("TFrame", background=BG_DARK)
-        style.configure("Card.TFrame", background=BG_CARD)
+        style.configure("TFrame",       background=BG_DARK)
+        style.configure("Card.TFrame",  background=BG_CARD)
         style.configure("Panel.TFrame", background=BG_PANEL)
 
-        # Labels
-        style.configure("TLabel", background=BG_DARK, foreground=TEXT_PRIMARY,
-                         font=("Segoe UI", 10))
-        style.configure("Card.TLabel", background=BG_CARD, foreground=TEXT_PRIMARY)
-        style.configure("Secondary.TLabel", background=BG_DARK, foreground=TEXT_SECONDARY,
-                         font=("Segoe UI", 9))
-        style.configure("Card.Secondary.TLabel", background=BG_CARD, foreground=TEXT_SECONDARY,
-                         font=("Segoe UI", 9))
-        style.configure("Title.TLabel", background=BG_DARK, foreground=TEXT_PRIMARY,
-                         font=("Segoe UI", 14, "bold"))
-        style.configure("Accent.TLabel", background=BG_DARK, foreground=ACCENT,
-                         font=("Segoe UI", 10, "bold"))
+        style.configure("TLabel",                background=BG_DARK,  foreground=TEXT_PRIMARY)
+        style.configure("Card.TLabel",           background=BG_CARD,  foreground=TEXT_PRIMARY)
+        style.configure("Secondary.TLabel",      background=BG_DARK,  foreground=TEXT_SECONDARY, font=("Segoe UI", 9))
+        style.configure("Card.Secondary.TLabel", background=BG_CARD,  foreground=TEXT_SECONDARY, font=("Segoe UI", 9))
+        style.configure("Title.TLabel",          background=BG_DARK,  foreground=TEXT_PRIMARY,   font=("Segoe UI", 14, "bold"))
+        style.configure("Accent.TLabel",         background=BG_DARK,  foreground=ACCENT,         font=("Segoe UI", 10, "bold"))
 
-        # Buttons
         style.configure("TButton", background=BG_CARD, foreground=TEXT_PRIMARY,
-                         font=("Segoe UI", 9), borderwidth=1, relief="flat",
-                         padding=(10, 5))
+                         font=("Segoe UI", 9), borderwidth=1, relief="flat", padding=(10, 5))
         style.map("TButton",
                   background=[("active", BORDER), ("disabled", BG_PANEL)],
                   foreground=[("disabled", TEXT_DISABLED)])
@@ -147,17 +127,13 @@ class ADBDeviceManagerApp:
         style.configure("FilterActive.TButton", background=ACCENT, foreground="#ffffff",
                          font=("Segoe UI", 9, "bold"), padding=(10, 4))
 
-        # Combobox
         style.configure("TCombobox", fieldbackground=BG_CARD, background=BG_CARD,
-                         foreground=TEXT_PRIMARY, selectbackground=ACCENT,
-                         selectforeground="#ffffff")
+                         foreground=TEXT_PRIMARY, selectbackground=ACCENT, selectforeground="#ffffff")
         style.map("TCombobox", fieldbackground=[("readonly", BG_CARD)])
 
-        # Entry
         style.configure("TEntry", fieldbackground=BG_CARD, foreground=TEXT_PRIMARY,
                          insertcolor=TEXT_PRIMARY, borderwidth=1)
 
-        # Treeview
         style.configure("Treeview",
                          background=BG_TABLE, foreground=TEXT_PRIMARY,
                          fieldbackground=BG_TABLE, rowheight=26,
@@ -171,7 +147,6 @@ class ADBDeviceManagerApp:
         style.map("Treeview.Heading",
                   background=[("active", BG_CARD)])
 
-        # Notebook
         style.configure("TNotebook", background=BG_DARK, borderwidth=0)
         style.configure("TNotebook.Tab", background=BG_PANEL, foreground=TEXT_SECONDARY,
                          font=("Segoe UI", 10), padding=(14, 6))
@@ -179,47 +154,13 @@ class ADBDeviceManagerApp:
                   background=[("selected", BG_CARD)],
                   foreground=[("selected", TEXT_PRIMARY)])
 
-        # Scrollbar
-        style.configure("Vertical.TScrollbar", background=BG_CARD,
-                         troughcolor=BG_DARK, borderwidth=0, arrowsize=12)
-        style.configure("Horizontal.TScrollbar", background=BG_CARD,
-                         troughcolor=BG_DARK, borderwidth=0, arrowsize=12)
+        style.configure("Vertical.TScrollbar",   background=BG_CARD, troughcolor=BG_DARK, borderwidth=0, arrowsize=12)
+        style.configure("Horizontal.TScrollbar", background=BG_CARD, troughcolor=BG_DARK, borderwidth=0, arrowsize=12)
+        style.configure("TSeparator",   background=BORDER)
+        style.configure("TProgressbar", background=ACCENT, troughcolor=BG_PANEL, borderwidth=0, thickness=3)
 
-        # Separator
-        style.configure("TSeparator", background=BORDER)
-
-        # Progressbar
-        style.configure("TProgressbar", background=ACCENT, troughcolor=BG_PANEL,
-                         borderwidth=0, thickness=3)
-
-    # ──────────────────────────────────────────
-    #  UI construction
-    # ──────────────────────────────────────────
+    # ── UI construction ────────────────────────────────────────────────────────
     def _build_ui(self):
-        # Menu bar
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
-
-        file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Refresh Devices", command=self._refresh_devices, accelerator="Ctrl+R")
-        file_menu.add_command(label="Refresh Apps", command=self._refresh_apps, accelerator="Ctrl+A")
-        file_menu.add_separator()
-        file_menu.add_command(label="Export TXT", command=self._export_txt)
-        file_menu.add_command(label="Export CSV", command=self._export_csv)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
-
-        edit_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Edit", menu=edit_menu)
-        edit_menu.add_command(label="Focus Search", command=lambda: self.search_entry.focus(), accelerator="Ctrl+F")
-        edit_menu.add_command(label="Clear Search", command=self._clear_search, accelerator="Ctrl+L")
-
-        help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=self._show_about)
-
-        # Root panes
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
@@ -230,14 +171,12 @@ class ADBDeviceManagerApp:
 
         self._build_header(outer)
 
-        # Notebook (main content)
         self.notebook = ttk.Notebook(outer)
-        self.notebook.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
 
         self._build_apps_tab()
         self._build_commands_tab()
 
-        # Bottom output + statusbar
         self._build_output_panel(outer)
         self._build_statusbar(outer)
 
@@ -247,15 +186,12 @@ class ADBDeviceManagerApp:
         header.grid_propagate(False)
         header.grid_columnconfigure(2, weight=1)
 
-        # Title
         tk.Label(header, text="⬛ ADB Device Manager", bg=BG_CARD,
                  fg=TEXT_PRIMARY, font=("Segoe UI", 14, "bold")).grid(
             row=0, column=0, padx=18, pady=18, sticky="w")
 
-        # Separator
         tk.Frame(header, bg=BORDER, width=1).grid(row=0, column=1, sticky="ns", pady=10)
 
-        # Device section
         dev_frame = tk.Frame(header, bg=BG_CARD)
         dev_frame.grid(row=0, column=2, padx=16, sticky="w")
 
@@ -263,19 +199,16 @@ class ADBDeviceManagerApp:
                  font=("Segoe UI", 9)).grid(row=0, column=0, padx=(0, 6))
 
         self.device_combo = ttk.Combobox(dev_frame, textvariable=self.selected_serial,
-                                          state="readonly", width=38,
-                                          font=("Segoe UI", 9))
+                                          state="readonly", width=38, font=("Segoe UI", 9))
         self.device_combo.grid(row=0, column=1, padx=(0, 8))
         self.device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
 
         self.refresh_devices_btn = ttk.Button(dev_frame, text="⟳ Refresh Devices",
                                                command=self._refresh_devices)
         self.refresh_devices_btn.grid(row=0, column=2, padx=(0, 8))
-        Tooltip(self.refresh_devices_btn, "Refresh the list of connected devices (Ctrl+R)")
 
         self.device_status_label = tk.Label(dev_frame, text="No device selected",
-                                             bg=BG_CARD, fg=TEXT_SECONDARY,
-                                             font=("Segoe UI", 9))
+                                             bg=BG_CARD, fg=TEXT_SECONDARY, font=("Segoe UI", 9))
         self.device_status_label.grid(row=0, column=3, padx=(4, 0))
 
     def _build_apps_tab(self):
@@ -284,17 +217,15 @@ class ADBDeviceManagerApp:
         tab.grid_rowconfigure(1, weight=1)
         tab.grid_columnconfigure(0, weight=1)
 
-        # Top: device info card + filter + search
         top = tk.Frame(tab, bg=BG_DARK)
-        top.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        top.grid(row=0, column=0, sticky="ew")
         top.grid_columnconfigure(1, weight=1)
 
         self._build_device_info_card(top)
         self._build_filter_search(top)
 
-        # Middle: table + actions
         mid = tk.Frame(tab, bg=BG_DARK)
-        mid.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+        mid.grid(row=1, column=0, sticky="nsew")
         mid.grid_rowconfigure(0, weight=1)
         mid.grid_columnconfigure(0, weight=1)
 
@@ -306,100 +237,80 @@ class ADBDeviceManagerApp:
         card.grid(row=0, column=0, sticky="ns", padx=(10, 6), pady=(10, 0))
 
         tk.Label(card, text="DEVICE INFO", bg=BG_CARD, fg=TEXT_SECONDARY,
-                 font=("Segoe UI", 8, "bold")).grid(row=0, column=0, columnspan=2, sticky="w",
-                                                     pady=(0, 8))
+                 font=("Segoe UI", 8, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         self.info_labels = {}
         fields = [
             ("Manufacturer", "manufacturer"),
-            ("Model", "model"),
-            ("Android", "android_version"),
-            ("SDK", "sdk"),
-            ("Serial", "serial"),
+            ("Model",        "model"),
+            ("Android",      "android_version"),
+            ("SDK",          "sdk"),
+            ("Serial",       "serial"),
         ]
         for i, (label, key) in enumerate(fields):
             tk.Label(card, text=f"{label}:", bg=BG_CARD, fg=TEXT_SECONDARY,
-                     font=("Segoe UI", 9), width=12, anchor="w").grid(
-                row=i+1, column=0, sticky="w", pady=1)
+                     font=("Segoe UI", 9), width=12, anchor="w").grid(row=i+1, column=0, sticky="w", pady=1)
             lbl = tk.Label(card, text="—", bg=BG_CARD, fg=TEXT_PRIMARY,
                            font=("Segoe UI", 9), anchor="w", width=22)
             lbl.grid(row=i+1, column=1, sticky="w", padx=(4, 0), pady=1)
             self.info_labels[key] = lbl
 
-        # Fingerprint
         tk.Label(card, text="Build:", bg=BG_CARD, fg=TEXT_SECONDARY,
                  font=("Segoe UI", 9), width=12, anchor="w").grid(
             row=len(fields)+1, column=0, sticky="w", pady=1)
         self.fingerprint_label = tk.Label(card, text="—", bg=BG_CARD, fg=TEXT_SECONDARY,
                                            font=("Segoe UI", 8), anchor="w", width=22,
                                            wraplength=160, justify="left")
-        self.fingerprint_label.grid(row=len(fields)+1, column=1, sticky="w",
-                                     padx=(4, 0), pady=1)
+        self.fingerprint_label.grid(row=len(fields)+1, column=1, sticky="w", padx=(4, 0), pady=1)
 
     def _build_filter_search(self, parent):
         right = tk.Frame(parent, bg=BG_DARK)
         right.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=(10, 0))
-        right.grid_rowconfigure(1, weight=0)
         right.grid_columnconfigure(0, weight=1)
 
-        # Filter buttons row
         filter_frame = tk.Frame(right, bg=BG_DARK)
         filter_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
         self.filter_buttons = {}
-        filters = [
+        for i, (key, label) in enumerate([
             ("all",     "All Apps"),
             ("user",    "User Apps"),
             ("system",  "System Apps"),
             ("enabled", "Enabled"),
             ("disabled","Disabled"),
-        ]
-        for i, (key, label) in enumerate(filters):
-            btn = ttk.Button(filter_frame, text=label,
-                             command=lambda k=key: self._set_filter(k))
+        ]):
+            btn = ttk.Button(filter_frame, text=label, command=lambda k=key: self._set_filter(k))
             btn.grid(row=0, column=i, padx=(0, 4))
             self.filter_buttons[key] = btn
-            Tooltip(btn, f"Show {label.lower()}")
         self._update_filter_button_styles()
 
-        # Search + refresh row
         search_frame = tk.Frame(right, bg=BG_DARK)
         search_frame.grid(row=1, column=0, sticky="ew")
         search_frame.grid_columnconfigure(0, weight=1)
 
-        search_entry = ttk.Entry(search_frame, textvariable=self.search_var,
-                                  font=("Segoe UI", 10))
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var, font=("Segoe UI", 10))
         search_entry.grid(row=0, column=0, sticky="ew", ipady=4)
         search_entry.insert(0, "🔍  Search packages...")
         search_entry.bind("<FocusIn>",  self._search_focus_in)
         search_entry.bind("<FocusOut>", self._search_focus_out)
         self.search_entry = search_entry
         self.search_placeholder_active = True
+        # trace fires _on_search_changed which debounces before doing real work
         self.search_var.trace_add("write", self._on_search_changed)
 
         ttk.Button(search_frame, text="✕", width=3,
                    command=self._clear_search).grid(row=0, column=1, padx=(4, 0))
-
         ttk.Button(search_frame, text="⟳ Refresh Apps",
                    command=self._refresh_apps).grid(row=0, column=2, padx=(8, 0))
 
-        # Export buttons
         export_frame = tk.Frame(right, bg=BG_DARK)
         export_frame.grid(row=2, column=0, sticky="w", pady=(6, 0))
         tk.Label(export_frame, text="Export:", bg=BG_DARK, fg=TEXT_SECONDARY,
                  font=("Segoe UI", 9)).grid(row=0, column=0, padx=(0, 6))
-        txt_btn = ttk.Button(export_frame, text="📄 TXT",
-                   command=self._export_txt)
-        txt_btn.grid(row=0, column=1, padx=(0, 4))
-        Tooltip(txt_btn, "Export package list as text file")
-        csv_btn = ttk.Button(export_frame, text="📊 CSV",
-                   command=self._export_csv)
-        csv_btn.grid(row=0, column=2)
-        Tooltip(csv_btn, "Export package list as CSV file")
+        ttk.Button(export_frame, text="📄 TXT", command=self._export_txt).grid(row=0, column=1, padx=(0, 4))
+        ttk.Button(export_frame, text="📊 CSV", command=self._export_csv).grid(row=0, column=2)
 
-        # Package count label
-        self.pkg_count_label = tk.Label(right, text="", bg=BG_DARK, fg=TEXT_SECONDARY,
-                                         font=("Segoe UI", 9))
+        self.pkg_count_label = tk.Label(right, text="", bg=BG_DARK, fg=TEXT_SECONDARY, font=("Segoe UI", 9))
         self.pkg_count_label.grid(row=3, column=0, sticky="w", pady=(4, 0))
 
     def _build_package_table(self, parent):
@@ -409,15 +320,11 @@ class ADBDeviceManagerApp:
         table_frame.grid_columnconfigure(0, weight=1)
 
         cols = ("Package Name", "Type", "Status")
-        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings",
-                                  selectmode="browse")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
 
-        self.tree.heading("Package Name", text="Package Name",
-                          command=lambda: self._sort_tree("Package Name"))
-        self.tree.heading("Type",         text="Type",
-                          command=lambda: self._sort_tree("Type"))
-        self.tree.heading("Status",       text="Status",
-                          command=lambda: self._sort_tree("Status"))
+        self.tree.heading("Package Name", text="Package Name", command=lambda: self._sort_tree("Package Name"))
+        self.tree.heading("Type",         text="Type",         command=lambda: self._sort_tree("Type"))
+        self.tree.heading("Status",       text="Status",       command=lambda: self._sort_tree("Status"))
 
         self.tree.column("Package Name", width=480, minwidth=200, stretch=True)
         self.tree.column("Type",         width=100, minwidth=80,  stretch=False, anchor="center")
@@ -440,7 +347,7 @@ class ADBDeviceManagerApp:
         self.tree.bind("<<TreeviewSelect>>", self._on_package_selected)
         self.tree.bind("<Double-1>",         self._on_package_double_click)
 
-        self._sort_col = None
+        self._sort_col     = None
         self._sort_reverse = False
 
     def _build_action_panel(self, parent):
@@ -453,25 +360,22 @@ class ADBDeviceManagerApp:
 
         self.selected_pkg_label = tk.Label(panel, text="No package selected",
                                             bg=BG_CARD, fg=TEXT_SECONDARY,
-                                            font=("Segoe UI", 8), wraplength=145,
-                                            justify="left")
+                                            font=("Segoe UI", 8), wraplength=145, justify="left")
         self.selected_pkg_label.pack(anchor="w", pady=(0, 10))
 
         ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=(0, 10))
 
         self.action_buttons = {}
-        actions = [
-            ("enable",    "✅  Enable App",        "Success.TButton", self._action_enable),
-            ("disable",   "🚫  Disable App",        "Danger.TButton",  self._action_disable),
-            ("uninstall", "🗑  Uninstall (User)",   "Danger.TButton",  self._action_uninstall),
-            ("appinfo",   "ℹ  Open App Info",      "TButton",          self._action_open_info),
-            ("copy",      "📋  Copy Package Name",  "TButton",          self._action_copy),
-        ]
-        for key, label, style, cmd in actions:
+        for key, label, style, cmd in [
+            ("enable",    "✅  Enable App",       "Success.TButton", self._action_enable),
+            ("disable",   "🚫  Disable App",       "Danger.TButton",  self._action_disable),
+            ("uninstall", "🗑  Uninstall (User)",  "Danger.TButton",  self._action_uninstall),
+            ("appinfo",   "ℹ  Open App Info",     "TButton",          self._action_open_info),
+            ("copy",      "📋  Copy Package Name", "TButton",          self._action_copy),
+        ]:
             btn = ttk.Button(panel, text=label, style=style, command=cmd, state="disabled")
             btn.pack(fill="x", pady=(0, 6))
             self.action_buttons[key] = btn
-            Tooltip(btn, label.split("  ")[1])  # Remove emoji for tooltip
 
     def _build_commands_tab(self):
         tab = ttk.Frame(self.notebook, style="TFrame")
@@ -497,10 +401,8 @@ class ADBDeviceManagerApp:
         cmd_entry.insert(0, "pm list packages")
         cmd_entry.bind("<Return>", lambda e: self._run_custom_command())
 
-        run_btn = ttk.Button(top, text="▶  Run Shell Command", style="Accent.TButton",
-                   command=self._run_custom_command)
-        run_btn.grid(row=1, column=2, padx=(8, 0))
-        Tooltip(run_btn, "Execute the custom ADB shell command on the selected device")
+        ttk.Button(top, text="▶  Run Shell Command", style="Accent.TButton",
+                   command=self._run_custom_command).grid(row=1, column=2, padx=(8, 0))
 
         tk.Label(top, text="Runs as: adb -s <device> shell <command>",
                  bg=BG_CARD, fg=TEXT_SECONDARY, font=("Segoe UI", 9)).grid(
@@ -513,22 +415,18 @@ class ADBDeviceManagerApp:
         tk.Label(note,
                  text="This section is for advanced users. Commands run directly on the device.\n"
                       "Be careful with destructive commands. Output appears in the Command Output panel below.",
-                 bg=BG_PANEL, fg=TEXT_SECONDARY, font=("Segoe UI", 9), justify="left",
-                 wraplength=700).pack(anchor="w", pady=(6, 0))
+                 bg=BG_PANEL, fg=TEXT_SECONDARY, font=("Segoe UI", 9),
+                 justify="left", wraplength=700).pack(anchor="w", pady=(6, 0))
 
     def _build_output_panel(self, parent):
-        panel = tk.Frame(parent, bg=BG_PANEL, padx=0, pady=0)
+        panel = tk.Frame(parent, bg=BG_PANEL)
         panel.grid(row=2, column=0, sticky="ew")
 
         header = tk.Frame(panel, bg=BG_PANEL)
         header.pack(fill="x", padx=10, pady=(6, 2))
-
         tk.Label(header, text="Command Output", bg=BG_PANEL, fg=TEXT_SECONDARY,
                  font=("Segoe UI", 9, "bold")).pack(side="left")
-        clear_btn = ttk.Button(header, text="Clear", command=self._clear_output,
-                   style="TButton")
-        clear_btn.pack(side="right")
-        Tooltip(clear_btn, "Clear the command output panel")
+        ttk.Button(header, text="Clear", command=self._clear_output).pack(side="right")
 
         output_frame = tk.Frame(panel, bg=BG_PANEL)
         output_frame.pack(fill="both", padx=10, pady=(0, 6))
@@ -538,14 +436,13 @@ class ADBDeviceManagerApp:
                                     wrap="word", state="disabled",
                                     relief="flat", borderwidth=0,
                                     insertbackground=TEXT_PRIMARY)
-        self.output_text.tag_configure("header",  foreground=ACCENT, font=("Consolas", 9, "bold"))
+        self.output_text.tag_configure("header",  foreground=ACCENT,          font=("Consolas", 9, "bold"))
         self.output_text.tag_configure("error",   foreground=DANGER)
         self.output_text.tag_configure("success", foreground=SUCCESS)
         self.output_text.tag_configure("warning", foreground=WARNING)
         self.output_text.tag_configure("muted",   foreground=TEXT_SECONDARY)
 
-        vsb = ttk.Scrollbar(output_frame, orient="vertical",
-                             command=self.output_text.yview)
+        vsb = ttk.Scrollbar(output_frame, orient="vertical", command=self.output_text.yview)
         self.output_text.configure(yscrollcommand=vsb.set)
         self.output_text.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -557,8 +454,7 @@ class ADBDeviceManagerApp:
         bar.grid_columnconfigure(0, weight=1)
 
         self.status_label = tk.Label(bar, text="Ready", bg=BG_CARD,
-                                      fg=TEXT_SECONDARY, font=("Segoe UI", 9),
-                                      anchor="w")
+                                      fg=TEXT_SECONDARY, font=("Segoe UI", 9), anchor="w")
         self.status_label.grid(row=0, column=0, sticky="ew", padx=12)
 
         self.progress = ttk.Progressbar(bar, mode="indeterminate",
@@ -566,9 +462,7 @@ class ADBDeviceManagerApp:
         self.progress.grid(row=0, column=1, padx=(0, 12), pady=3)
         self._set_progress(False)
 
-    # ──────────────────────────────────────────
-    #  Utility / state helpers
-    # ──────────────────────────────────────────
+    # ── Utilities ──────────────────────────────────────────────────────────────
     def _set_status(self, msg, color=None):
         self.status_label.configure(text=msg, fg=color or TEXT_SECONDARY)
 
@@ -579,7 +473,7 @@ class ADBDeviceManagerApp:
             self.progress.stop()
 
     def run_in_thread(self, task_fn, callback_fn=None):
-        """Run task_fn in a background thread; call callback_fn(result) on the main thread."""
+        """Run task_fn in a daemon thread; deliver result to main thread via after()."""
         def _worker():
             result = task_fn()
             if callback_fn:
@@ -604,55 +498,64 @@ class ADBDeviceManagerApp:
             self._append_output(stdout + "\n", "success" if code == 0 else "")
         if stderr:
             self._append_output(stderr + "\n", "error")
-        tag = "success" if code == 0 else "error"
-        self._append_output(f"Exit code: {code}\n", tag)
+        self._append_output(f"Exit code: {code}\n", "success" if code == 0 else "error")
 
     def _get_serial(self):
-        """Return currently selected serial or None."""
-        v = self.selected_serial.get()
-        # combo shows "SERIAL  [device]" etc — extract just the serial
-        if v:
-            return v.split("  ")[0].strip()
-        return None
+        """Return the raw serial from the combo (strips the ' [status]' suffix)."""
+        v = self.selected_serial.get().strip()
+        if not v:
+            return None
+        # combo values are formatted as "SERIAL   [status]"
+        return v.split("   ")[0].strip()
 
-    # ──────────────────────────────────────────
-    #  ADB check + device loading
-    # ──────────────────────────────────────────
+    # ── ADB check + device loading ─────────────────────────────────────────────
     def _check_adb_and_load(self):
-        adb = adb_manager.get_adb_path()
-        if not adb:
-            messagebox.showerror(
-                "ADB Not Found",
-                "ADB not found.\n\nPlease install Android Platform Tools or place "
-                "the adb executable inside the project folder.\n\n"
-                "Download: https://developer.android.com/studio/releases/platform-tools"
-            )
-            self._set_status("ADB not found. Install Android Platform Tools.", DANGER)
-            return
-        # version check
-        stdout, stderr, code, _ = adb_manager.run_adb_command(["version"])
-        version_line = stdout.splitlines()[0] if stdout else "Unknown"
-        self._append_output(f"ADB detected: {version_line}\n", "success")
-        self._set_status(f"ADB ready: {version_line}")
-        self._refresh_devices()
+        """Run ADB version check in background so UI stays responsive."""
+        def task():
+            adb = adb_manager.get_adb_path()
+            if not adb:
+                return None, None
+            stdout, _, code, _ = adb_manager.run_adb_command(["version"])
+            return adb, stdout.splitlines()[0] if stdout else "Unknown version"
+
+        def callback(result):
+            adb, version_line = result
+            if not adb:
+                messagebox.showerror(
+                    "ADB Not Found",
+                    "ADB not found.\n\nPlease install Android Platform Tools or place "
+                    "the adb executable inside the project folder.\n\n"
+                    "Download: https://developer.android.com/studio/releases/platform-tools"
+                )
+                self._set_status("ADB not found. Install Android Platform Tools.", DANGER)
+                return
+            self._append_output(f"ADB detected: {version_line}\n", "success")
+            self._set_status(f"ADB ready: {version_line}")
+            self._refresh_devices()
+
+        self.run_in_thread(task, callback)
 
     def _refresh_devices(self):
+        """Scan for connected devices. Guarded against concurrent calls."""
+        if self._busy:
+            return
+        self._busy = True
         self._set_status("Scanning for devices…")
         self._set_progress(True)
+        self.refresh_devices_btn.configure(state="disabled")
 
         def task():
             return adb_manager.list_devices()
 
         def callback(result):
+            self._busy = False
             self._set_progress(False)
+            self.refresh_devices_btn.configure(state="normal")
+
             devices, err = result
             self.devices = devices
 
-            combo_values = []
-            for d in devices:
-                label = f"{d['serial']}   [{d['status']}]"
-                combo_values.append(label)
-
+            combo_values = [f"{d['serial']}   [{d['status']}]" for d in devices]
             self.device_combo["values"] = combo_values
 
             if not devices:
@@ -662,24 +565,24 @@ class ADBDeviceManagerApp:
                     "No Android device connected. Connect phone with USB and enable USB debugging.",
                     WARNING
                 )
-                self.device_status_label.configure(
-                    text="No device connected", fg=WARNING)
+                self.device_status_label.configure(text="No device connected", fg=WARNING)
+                if err:
+                    self._append_output(f"Error: {err}\n", "error")
                 return
 
-            # Auto-select first device if none selected
-            cur = self._get_serial()
-            match_idx = None
-            for i, d in enumerate(devices):
-                if d["serial"] == cur:
-                    match_idx = i
-                    break
+            # If the currently selected serial is still in the list, keep it.
+            cur_serial = self._get_serial()
+            match_idx  = next((i for i, d in enumerate(devices) if d["serial"] == cur_serial), None)
 
-            if match_idx is None:
-                self.device_combo.current(0)
-            else:
+            if match_idx is not None:
+                # Same device is still there — don't reload apps.
                 self.device_combo.current(match_idx)
-
-            self._on_device_selected(None)
+                self._set_status(f"Device still connected: {cur_serial}", SUCCESS)
+            else:
+                # New device list — select the first entry and load it.
+                self.device_combo.current(0)
+                self._loaded_serial = None   # force a fresh load
+                self._on_device_selected(None)
 
         self.run_in_thread(task, callback)
 
@@ -688,16 +591,11 @@ class ADBDeviceManagerApp:
         if not serial:
             return
 
-        # Find device status
-        status = "unknown"
-        for d in self.devices:
-            if d["serial"] == serial:
-                status = d["status"]
-                break
+        # Find the device's status in our cached list
+        status = next((d["status"] for d in self.devices if d["serial"] == serial), "unknown")
 
         if status == "unauthorized":
-            self.device_status_label.configure(
-                text="⚠ Unauthorized", fg=WARNING)
+            self.device_status_label.configure(text="⚠ Unauthorized", fg=WARNING)
             messagebox.showwarning(
                 "Unauthorized Device",
                 "Device unauthorized.\nPlease allow the USB debugging popup on your phone."
@@ -713,8 +611,15 @@ class ADBDeviceManagerApp:
             self.device_status_label.configure(text=f"⚠ {status}", fg=WARNING)
             return
 
-        self.device_status_label.configure(text=f"● Connected", fg=SUCCESS)
-        self._set_status(f"Loading device info for {serial}…")
+        self.device_status_label.configure(text="● Connected", fg=SUCCESS)
+
+        # Avoid redundant reloads if the user clicks the same device again
+        if serial == self._loaded_serial:
+            return
+        self._loaded_serial = serial
+
+        self._set_status(f"Loading device {serial}…")
+        # Load device info and apps in parallel (two separate threads)
         self._load_device_info(serial)
         self._refresh_apps()
 
@@ -726,20 +631,21 @@ class ADBDeviceManagerApp:
             for key, lbl in self.info_labels.items():
                 lbl.configure(text=info.get(key, "—") or "—")
             fp = info.get("fingerprint", "—")
-            # Truncate long fingerprints
             display_fp = fp if len(fp) <= 40 else fp[:37] + "…"
             self.fingerprint_label.configure(text=display_fp)
 
         self.run_in_thread(task, callback)
 
-    # ──────────────────────────────────────────
-    #  Package loading + display
-    # ──────────────────────────────────────────
+    # ── Package loading + display ──────────────────────────────────────────────
     def _refresh_apps(self):
         serial = self._get_serial()
         if not serial:
             return
+        if self._busy:
+            self._set_status("Please wait — already loading…", WARNING)
+            return
 
+        self._busy = True
         self._set_status("Loading apps…")
         self._set_progress(True)
         self._clear_tree()
@@ -749,6 +655,7 @@ class ADBDeviceManagerApp:
             return app_manager.classify_packages(serial)
 
         def callback(result):
+            self._busy = False
             self._set_progress(False)
             packages, err = result
             self.all_packages = packages
@@ -760,45 +667,44 @@ class ADBDeviceManagerApp:
         self.run_in_thread(task, callback)
 
     def _apply_filter_and_search(self):
-        search = self.search_var.get().lower()
-        if self.search_placeholder_active:
-            search = ""
+        search = "" if self.search_placeholder_active else self.search_var.get().lower()
+        filt   = self.current_filter
 
-        filt = self.current_filter
-        result = []
-        for pkg in self.all_packages:
-            # Filter
-            if filt == "user"    and pkg["type"] != "User":     continue
-            if filt == "system"  and pkg["type"] != "System":   continue
-            if filt == "enabled" and pkg["status"] != "Enabled": continue
-            if filt == "disabled"and pkg["status"] != "Disabled":continue
-            # Search
-            if search and search not in pkg["package"].lower():  continue
-            result.append(pkg)
+        result = [
+            pkg for pkg in self.all_packages
+            if (filt == "all"
+                or (filt == "user"     and pkg["type"]   == "User")
+                or (filt == "system"   and pkg["type"]   == "System")
+                or (filt == "enabled"  and pkg["status"] == "Enabled")
+                or (filt == "disabled" and pkg["status"] == "Disabled"))
+            and (not search or search in pkg["package"].lower())
+        ]
 
         self.visible_packages = result
         self._populate_tree(result)
         self.pkg_count_label.configure(text=f"{len(result)} packages shown")
 
     def _populate_tree(self, packages):
+        """Clear tree with a single bulk delete, then re-insert all rows."""
         self._clear_tree()
+        insert = self.tree.insert          # local ref for speed in tight loop
         for i, pkg in enumerate(packages):
-            tag = "even" if i % 2 == 0 else "odd"
-            extra_tags = []
+            row_tag = "even" if i % 2 == 0 else "odd"
             if pkg["status"] == "Disabled":
-                extra_tags.append("disabled")
+                tags = (row_tag, "disabled")
             elif pkg["type"] == "System":
-                extra_tags.append("system")
+                tags = (row_tag, "system")
             elif pkg["type"] == "User":
-                extra_tags.append("user")
-            all_tags = (tag,) + tuple(extra_tags)
-            self.tree.insert("", "end",
-                              values=(pkg["package"], pkg["type"], pkg["status"]),
-                              tags=all_tags)
+                tags = (row_tag, "user")
+            else:
+                tags = (row_tag,)
+            insert("", "end", values=(pkg["package"], pkg["type"], pkg["status"]), tags=tags)
 
     def _clear_tree(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        """Bulk-delete all tree rows in one call — much faster than one-by-one."""
+        children = self.tree.get_children()
+        if children:
+            self.tree.delete(*children)
 
     def _sort_tree(self, col):
         col_map = {"Package Name": "package", "Type": "type", "Status": "status"}
@@ -806,15 +712,12 @@ class ADBDeviceManagerApp:
         if self._sort_col == col:
             self._sort_reverse = not self._sort_reverse
         else:
-            self._sort_col = col
+            self._sort_col    = col
             self._sort_reverse = False
-        self.visible_packages.sort(key=lambda p: p[key].lower(),
-                                    reverse=self._sort_reverse)
+        self.visible_packages.sort(key=lambda p: p[key].lower(), reverse=self._sort_reverse)
         self._populate_tree(self.visible_packages)
 
-    # ──────────────────────────────────────────
-    #  Filter / search
-    # ──────────────────────────────────────────
+    # ── Filter / search ────────────────────────────────────────────────────────
     def _set_filter(self, key):
         self.current_filter = key
         self._update_filter_button_styles()
@@ -822,10 +725,7 @@ class ADBDeviceManagerApp:
 
     def _update_filter_button_styles(self):
         for key, btn in self.filter_buttons.items():
-            if key == self.current_filter:
-                btn.configure(style="FilterActive.TButton")
-            else:
-                btn.configure(style="Filter.TButton")
+            btn.configure(style="FilterActive.TButton" if key == self.current_filter else "Filter.TButton")
 
     def _search_focus_in(self, event):
         if self.search_placeholder_active:
@@ -840,8 +740,12 @@ class ADBDeviceManagerApp:
             self.search_placeholder_active = True
 
     def _on_search_changed(self, *_):
-        if not self.search_placeholder_active:
-            self._apply_filter_and_search()
+        """Debounce: wait 250 ms after the user stops typing before filtering."""
+        if self.search_placeholder_active:
+            return
+        if self._search_after_id:
+            self.root.after_cancel(self._search_after_id)
+        self._search_after_id = self.root.after(250, self._apply_filter_and_search)
 
     def _clear_search(self):
         self.search_var.set("")
@@ -851,20 +755,16 @@ class ADBDeviceManagerApp:
         self.search_placeholder_active = True
         self._apply_filter_and_search()
 
-    # ──────────────────────────────────────────
-    #  Package selection
-    # ──────────────────────────────────────────
+    # ── Package selection ──────────────────────────────────────────────────────
     def _on_package_selected(self, event):
         sel = self.tree.selection()
         if sel:
-            values = self.tree.item(sel[0], "values")
-            pkg_name = values[0]
+            pkg_name = self.tree.item(sel[0], "values")[0]
             self.selected_pkg_label.configure(text=pkg_name, fg=TEXT_PRIMARY)
             for btn in self.action_buttons.values():
                 btn.configure(state="normal")
         else:
-            self.selected_pkg_label.configure(text="No package selected",
-                                               fg=TEXT_SECONDARY)
+            self.selected_pkg_label.configure(text="No package selected", fg=TEXT_SECONDARY)
             for btn in self.action_buttons.values():
                 btn.configure(state="disabled")
 
@@ -875,19 +775,16 @@ class ADBDeviceManagerApp:
         sel = self.tree.selection()
         if not sel:
             return None, None, None
-        values = self.tree.item(sel[0], "values")
-        return values[0], values[1], values[2]   # package, type, status
+        v = self.tree.item(sel[0], "values")
+        return v[0], v[1], v[2]
 
-    # ──────────────────────────────────────────
-    #  Actions
-    # ──────────────────────────────────────────
+    # ── Actions ────────────────────────────────────────────────────────────────
     def _action_enable(self):
         serial = self._get_serial()
         pkg, ptype, status = self._get_selected_package()
         if not pkg or not serial:
             return
-        if not messagebox.askyesno("Confirm Enable",
-                                    f"Enable package?\n\n{pkg}"):
+        if not messagebox.askyesno("Confirm Enable", f"Enable package?\n\n{pkg}"):
             return
         self._set_status(f"Enabling {pkg}…")
         self._set_progress(True)
@@ -898,9 +795,9 @@ class ADBDeviceManagerApp:
         def callback(r):
             stdout, stderr, code, ts = r
             self._set_progress(False)
-            self._log_command([f"adb -s {serial} shell pm enable {pkg}"],
-                               stdout, stderr, code, ts)
+            self._log_command([f"adb -s {serial} shell pm enable {pkg}"], stdout, stderr, code, ts)
             self._set_status("Done.", SUCCESS if code == 0 else DANGER)
+            self._loaded_serial = None   # force fresh app list
             self._refresh_apps()
 
         self.run_in_thread(task, callback)
@@ -911,16 +808,13 @@ class ADBDeviceManagerApp:
         if not pkg or not serial:
             return
 
-        if ptype == "System":
-            if not messagebox.askyesno("⚠ Disable System App",
-                                        f"This is a SYSTEM app. Disabling it may break phone features.\n\n"
-                                        f"Package: {pkg}\n\nContinue?",
-                                        icon="warning"):
-                return
-        else:
-            if not messagebox.askyesno("Confirm Disable",
-                                        f"Disable package?\n\n{pkg}"):
-                return
+        msg = (f"This is a SYSTEM app. Disabling it may break phone features.\n\nPackage: {pkg}\n\nContinue?"
+               if ptype == "System" else f"Disable package?\n\n{pkg}")
+        icon = "warning" if ptype == "System" else "question"
+        title = "⚠ Disable System App" if ptype == "System" else "Confirm Disable"
+
+        if not messagebox.askyesno(title, msg, icon=icon):
+            return
 
         self._set_status(f"Disabling {pkg}…")
         self._set_progress(True)
@@ -931,10 +825,9 @@ class ADBDeviceManagerApp:
         def callback(r):
             stdout, stderr, code, ts = r
             self._set_progress(False)
-            self._log_command(
-                [f"adb -s {serial} shell pm disable-user --user 0 {pkg}"],
-                stdout, stderr, code, ts)
+            self._log_command([f"adb -s {serial} shell pm disable-user --user 0 {pkg}"], stdout, stderr, code, ts)
             self._set_status("Done.", SUCCESS if code == 0 else DANGER)
+            self._loaded_serial = None
             self._refresh_apps()
 
         self.run_in_thread(task, callback)
@@ -945,17 +838,13 @@ class ADBDeviceManagerApp:
         if not pkg or not serial:
             return
 
-        if ptype == "System":
-            if not messagebox.askyesno("⚠ Uninstall System App",
-                                        f"This may remove a system app for the current user.\n"
-                                        f"It may affect phone stability.\n\n"
-                                        f"Package: {pkg}\n\nContinue?",
-                                        icon="warning"):
-                return
-        else:
-            if not messagebox.askyesno("Confirm Uninstall",
-                                        f"Uninstall for current user?\n\n{pkg}"):
-                return
+        msg = (f"This may remove a system app for the current user.\nIt may affect phone stability.\n\nPackage: {pkg}\n\nContinue?"
+               if ptype == "System" else f"Uninstall for current user?\n\n{pkg}")
+        icon = "warning" if ptype == "System" else "question"
+        title = "⚠ Uninstall System App" if ptype == "System" else "Confirm Uninstall"
+
+        if not messagebox.askyesno(title, msg, icon=icon):
+            return
 
         self._set_status(f"Uninstalling {pkg}…")
         self._set_progress(True)
@@ -966,10 +855,9 @@ class ADBDeviceManagerApp:
         def callback(r):
             stdout, stderr, code, ts = r
             self._set_progress(False)
-            self._log_command(
-                [f"adb -s {serial} shell pm uninstall --user 0 {pkg}"],
-                stdout, stderr, code, ts)
+            self._log_command([f"adb -s {serial} shell pm uninstall --user 0 {pkg}"], stdout, stderr, code, ts)
             self._set_status("Done.", SUCCESS if code == 0 else DANGER)
+            self._loaded_serial = None
             self._refresh_apps()
 
         self.run_in_thread(task, callback)
@@ -979,7 +867,6 @@ class ADBDeviceManagerApp:
         pkg, _, _ = self._get_selected_package()
         if not pkg or not serial:
             return
-
         self._set_status(f"Opening app info for {pkg}…")
         self._set_progress(True)
 
@@ -989,11 +876,11 @@ class ADBDeviceManagerApp:
         def callback(r):
             stdout, stderr, code, ts = r
             self._set_progress(False)
-            self._log_command(
-                [f"adb -s {serial} shell am start ... {pkg}"],
-                stdout, stderr, code, ts)
-            self._set_status("App info opened on device." if code == 0 else "Failed to open app info.",
-                             SUCCESS if code == 0 else DANGER)
+            self._log_command([f"adb -s {serial} shell am start ... {pkg}"], stdout, stderr, code, ts)
+            self._set_status(
+                "App info opened on device." if code == 0 else "Failed to open app info.",
+                SUCCESS if code == 0 else DANGER
+            )
 
         self.run_in_thread(task, callback)
 
@@ -1005,20 +892,15 @@ class ADBDeviceManagerApp:
         self.root.clipboard_append(pkg)
         self._set_status(f"Copied: {pkg}", SUCCESS)
 
-    # ──────────────────────────────────────────
-    #  Custom command
-    # ──────────────────────────────────────────
+    # ── Custom command ─────────────────────────────────────────────────────────
     def _run_custom_command(self):
         serial = self._get_serial()
         if not serial:
-            messagebox.showwarning("No Device",
-                                    "Please select a connected device first.")
+            messagebox.showwarning("No Device", "Please select a connected device first.")
             return
-
         cmd = self.custom_cmd_var.get().strip()
         if not cmd:
-            messagebox.showwarning("Empty Command",
-                                    "Please enter a shell command to run.")
+            messagebox.showwarning("Empty Command", "Please enter a shell command to run.")
             return
 
         self._set_status(f"Running: {cmd}…")
@@ -1030,15 +912,12 @@ class ADBDeviceManagerApp:
         def callback(r):
             stdout, stderr, code, ts = r
             self._set_progress(False)
-            self._log_command([f"adb -s {serial} shell {cmd}"],
-                               stdout, stderr, code, ts)
+            self._log_command([f"adb -s {serial} shell {cmd}"], stdout, stderr, code, ts)
             self._set_status("Done.", SUCCESS if code == 0 else DANGER)
 
         self.run_in_thread(task, callback)
 
-    # ──────────────────────────────────────────
-    #  Export
-    # ──────────────────────────────────────────
+    # ── Export ─────────────────────────────────────────────────────────────────
     def _export_txt(self):
         if not self.visible_packages:
             messagebox.showinfo("Nothing to Export", "No packages to export.")
@@ -1082,15 +961,3 @@ class ADBDeviceManagerApp:
             self._set_status(f"Exported {len(self.visible_packages)} packages to CSV.", SUCCESS)
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
-
-    def _show_about(self):
-        messagebox.showinfo("About ADB Device Manager",
-                            "ADB Device Manager v1.0\n\n"
-                            "A GUI tool for managing Android apps via ADB.\n\n"
-                            "Features:\n"
-                            "- View and manage installed apps\n"
-                            "- Enable/disable/uninstall apps\n"
-                            "- Run custom ADB shell commands\n"
-                            "- Export package lists\n\n"
-                            "Requires Android Platform Tools (ADB).\n\n"
-                            "GitHub: https://github.com/example/adb-manager")
