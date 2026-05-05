@@ -1,5 +1,1 @@
-# No external runtime dependencies are required.
-# This app uses Python's standard library only.
-#
-# Optional packaging dependency:
-# pyinstaller
+PySide6>=6.7
