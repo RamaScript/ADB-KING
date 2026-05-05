@@ -8,6 +8,8 @@ IMPROVEMENTS:
   This is the single biggest speed improvement (saves ~3-9 seconds).
 """
 
+import shlex
+
 from adb_manager import run_adb_command
 
 
@@ -136,6 +138,26 @@ def list_disabled_packages(serial):
 def compute_enabled_packages(all_pkgs, disabled_pkgs):
     return all_pkgs - disabled_pkgs
 
+def search_packages(serial, query=""):
+    """Search packages using cmd package list packages -u --user all.
+
+    If a query is provided, grep is used to restrict the output to matches.
+    """
+    shell_cmd = "cmd package list packages -u --user all"
+    if query:
+        shell_cmd += f" | grep -i {shlex.quote(query)}"
+
+    stdout, stderr, code, _ = run_adb_command(
+        ["-s", serial, "shell", shell_cmd], timeout=60
+    )
+
+    # grep returns exit code 1 when no matches are found.
+    if code == 1 and not stdout:
+        return [], ""
+    if code != 0:
+        return [], stderr or "Failed to search packages."
+
+    return sorted(_parse_packages(stdout)), ""
 
 # ── App actions ───────────────────────────────────────────────────────────────
 
@@ -153,7 +175,7 @@ def enable_package(serial, package_name):
 
 def uninstall_package_for_user(serial, package_name):
     return run_adb_command(
-        ["-s", serial, "shell", "pm", "uninstall", "--user", "0", package_name]
+        ["-s", serial, "shell", "cmd", "package", "uninstall", package_name]
     )
 
 

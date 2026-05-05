@@ -1,8 +1,5 @@
-# ADB Device Manager — Requirements
-customtkinter
-
-# All other dependencies are part of the Python 3 standard library:
-#   tkinter, ttk, subprocess, threading, platform, os, csv, datetime
-
-# Optional: only needed if you want to package the app as an executable
+# No external runtime dependencies are required.
+# This app uses Python's standard library only.
+#
+# Optional packaging dependency:
 # pyinstaller
