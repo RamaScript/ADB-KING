@@ -1,4 +1,4 @@
-name: Build and Release Desktop App
+name: Build and Release ADB KING
 
 on:
   push:

@@ -1,6 +1,6 @@
 """
 ui.py
-PySide6 UI for ADB Device Manager.
+PySide6 UI for ADB KING.
 """
 
 from __future__ import annotations
@@ -10,8 +10,8 @@ import traceback
 from datetime import datetime
 from functools import partial
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal
-from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut, QTextCursor
+from PySide6.QtCore import QObject, QRunnable, QSettings, QThreadPool, Qt, Signal
+from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 import adb_manager
 import app_manager
+from app_metadata import APP_DESCRIPTION, APP_NAME, DEFAULT_THEME, resolve_logo_path
 
 
 FILTER_TABS = [
@@ -73,6 +74,12 @@ QLabel[role="title"] {
     color: #0d213a;
     font-size: 30px;
     font-weight: 700;
+}
+QLabel[role="logo"] {
+    background: rgba(255, 255, 255, 0.96);
+    border: 1px solid rgba(188, 204, 223, 0.9);
+    border-radius: 20px;
+    padding: 8px;
 }
 QLabel[role="section"] {
     color: #10233d;
@@ -284,6 +291,12 @@ QLabel[role="title"] {
     color: #f5f8fd;
     font-size: 30px;
     font-weight: 700;
+}
+QLabel[role="logo"] {
+    background: rgba(23, 32, 46, 0.98);
+    border: 1px solid rgba(42, 56, 77, 0.95);
+    border-radius: 20px;
+    padding: 8px;
 }
 QLabel[role="section"] {
     color: #eef3fb;
@@ -497,10 +510,11 @@ class FunctionWorker(QRunnable):
             self.signals.finished.emit()
 
 
-class ADBDeviceManagerApp(QMainWindow):
+class ADBKingApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.thread_pool = QThreadPool.globalInstance()
+        self.settings = QSettings()
 
         self.devices = []
         self.packages = []
@@ -508,7 +522,7 @@ class ADBDeviceManagerApp(QMainWindow):
         self.selected_serial = None
         self.selected_package_name = None
         self.busy_count = 0
-        self.current_theme = "Light"
+        self.current_theme = DEFAULT_THEME
         self.output_collapsed = False
         self._tables_syncing = False
         self._has_shown_adb_warning = False
@@ -519,13 +533,14 @@ class ADBDeviceManagerApp(QMainWindow):
         self.tab_indices = {}
         self.device_info_labels = {}
 
-        self.setWindowTitle("ADB Device Manager")
+        self.setWindowTitle(APP_NAME)
         self.resize(1460, 920)
         self.setMinimumSize(900, 640)
 
         self._build_ui()
-        self._apply_theme("Light")
         self._connect_shortcuts()
+        self._restore_persisted_state()
+        self._apply_theme(self.current_theme)
         self._set_device_badge("idle", "No device selected")
         self._set_activity_badge("idle", "Ready")
         self._set_device_hint("Connect your Android phone with USB debugging enabled.")
@@ -608,15 +623,19 @@ class ADBDeviceManagerApp(QMainWindow):
         layout.setContentsMargins(18, 14, 18, 14)
         layout.setSpacing(14)
 
+        logo_label = self._create_brand_logo_label()
+        if logo_label is not None:
+            layout.addWidget(logo_label, 0, Qt.AlignTop)
+
         title_column = QVBoxLayout()
         title_column.setContentsMargins(0, 0, 0, 0)
         title_column.setSpacing(2)
 
-        title = QLabel("ADB Device Manager")
+        title = QLabel(APP_NAME)
         title.setProperty("role", "title")
         title_column.addWidget(title)
 
-        subtitle = QLabel("Manage Android apps over USB with a faster, cleaner desktop workflow.")
+        subtitle = QLabel(APP_DESCRIPTION)
         subtitle.setProperty("role", "subtitle")
         subtitle.setWordWrap(True)
         title_column.addWidget(subtitle)
@@ -639,6 +658,29 @@ class ADBDeviceManagerApp(QMainWindow):
 
         layout.addLayout(badge_column)
         return card
+
+    def _create_brand_logo_label(self):
+        logo_path = resolve_logo_path()
+        if not logo_path:
+            return None
+
+        pixmap = QPixmap(logo_path)
+        if pixmap.isNull():
+            return None
+
+        label = QLabel()
+        label.setProperty("role", "logo")
+        label.setAlignment(Qt.AlignCenter)
+        label.setFixedSize(76, 76)
+        label.setPixmap(
+            pixmap.scaled(
+                56,
+                56,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+        return label
 
     def _build_device_toolbar_card(self):
         card = self._create_card()
@@ -1012,6 +1054,13 @@ class ADBDeviceManagerApp(QMainWindow):
         self._update_splitter_orientation()
         self._update_responsive_layouts()
 
+    def closeEvent(self, event):
+        self.settings.setValue("ui/theme", self.current_theme)
+        self.settings.setValue("ui/output_collapsed", self.output_collapsed)
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/maximized", self.isMaximized())
+        super().closeEvent(event)
+
     def _update_splitter_orientation(self, force=False):
         mode = "stacked" if self.width() < 1220 else "side-by-side"
         if not force and mode == self._main_splitter_mode:
@@ -1102,9 +1151,39 @@ class ADBDeviceManagerApp(QMainWindow):
         self.apps_controls_grid.addWidget(self.export_txt_button, 2, 1)
         self.apps_controls_grid.setColumnStretch(0, 1)
 
+    def _read_bool_setting(self, key, default=False):
+        value = self.settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _restore_persisted_state(self):
+        theme_name = self.settings.value("ui/theme", DEFAULT_THEME)
+        if theme_name in {"Light", "Dark"}:
+            self.current_theme = theme_name
+
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.setCurrentText(self.current_theme)
+        self.theme_combo.blockSignals(False)
+
+        geometry = self.settings.value("window/geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+
+        if self._read_bool_setting("window/maximized", False):
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
+
+        self._update_splitter_orientation(force=True)
+        self._update_responsive_layouts(force=True)
+
+        if self._read_bool_setting("ui/output_collapsed", False):
+            self._toggle_output_panel()
+
     def _apply_theme(self, theme_name):
         if theme_name not in {"Light", "Dark"}:
-            theme_name = "Light"
+            theme_name = DEFAULT_THEME
         self.current_theme = theme_name
         stylesheet = LIGHT_STYLESHEET if theme_name == "Light" else DARK_STYLESHEET
         self.setStyleSheet(stylesheet)

@@ -1,4 +1,4 @@
-# ADB Device Manager
+# ADB KING
 
 A PySide6 desktop app for managing Android apps over ADB without typing terminal commands.
 
@@ -98,9 +98,9 @@ python build_release.py
 
 Output:
 
-- Windows: `release/ADB-KING-windows-x64.zip`
-- macOS Intel: `release/ADB-KING-macos-x64.zip`
-- macOS Apple Silicon: `release/ADB-KING-macos-arm64.zip`
+- Windows: `release/ADB KING-windows-x64.zip`
+- macOS Intel: `release/ADB KING-macos-x64.zip`
+- macOS Apple Silicon: `release/ADB KING-macos-arm64.zip`
 
 Notes:
 
@@ -129,7 +129,7 @@ That workflow:
 If the local folder is not connected to GitHub yet, you can do it with GitHub CLI:
 
 ```bash
-gh repo create ADB-KING --public --source=. --remote=origin --push
+gh repo create adb-king --public --source=. --remote=origin --push
 ```
 
 ### Releasing a Version
@@ -194,7 +194,7 @@ Without this, the app may still run, but users can see the "developer cannot be 
 ## Project Structure
 
 ```text
-ADB-KING/
+ADB KING/
 ├── .github/workflows/release.yml
 ├── adb_manager.py
 ├── app_manager.py

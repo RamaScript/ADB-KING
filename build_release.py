@@ -11,20 +11,22 @@ macOS:
 
 from __future__ import annotations
 
+import os
 import platform
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 
+from app_metadata import APP_BUNDLE_ID, APP_NAME
 
-APP_NAME = "ADB-KING"
 ROOT = Path(__file__).resolve().parent
 DIST_DIR = ROOT / "dist"
 WORK_DIR = ROOT / "build" / "pyinstaller"
 SPEC_DIR = ROOT / "build" / "spec"
 RELEASE_DIR = ROOT / "release"
 RESOURCES_DIR = ROOT / "resources"
+PYINSTALLER_CONFIG_DIR = ROOT / ".pyinstaller-config"
 
 
 def _normalized_arch():
@@ -89,9 +91,17 @@ def _resolve_platform_tools_dir():
     )
 
 
-def _resource_arg():
+def _data_arg(source, target):
     separator = ";" if platform.system() == "Windows" else ":"
-    return f"{RESOURCES_DIR}{separator}resources"
+    return f"{source}{separator}{target}"
+
+
+def _data_args():
+    args = [_data_arg(RESOURCES_DIR, "resources")]
+    icon_path = ROOT / "icon.png"
+    if icon_path.is_file():
+        args.append(_data_arg(icon_path, "resources/branding"))
+    return args
 
 
 def _icon_args():
@@ -122,14 +132,15 @@ def _build_pyinstaller_command():
         "--specpath",
         str(SPEC_DIR),
         "--windowed",
-        "--add-data",
-        _resource_arg(),
     ]
+
+    for data_arg in _data_args():
+        command.extend(["--add-data", data_arg])
 
     if platform.system() == "Windows":
         command.append("--onefile")
     elif platform.system() == "Darwin":
-        command.extend(["--osx-bundle-identifier", "com.ramascript.adbking"])
+        command.extend(["--osx-bundle-identifier", APP_BUNDLE_ID])
 
     command.extend(_icon_args())
     command.append(str(ROOT / "main.py"))
@@ -159,14 +170,17 @@ def _zip_macos_asset(app_path, zip_path):
 def main():
     _resolve_platform_tools_dir()
 
+    PYINSTALLER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     RELEASE_DIR.mkdir(parents=True, exist_ok=True)
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     SPEC_DIR.mkdir(parents=True, exist_ok=True)
 
     command = _build_pyinstaller_command()
+    env = os.environ.copy()
+    env.setdefault("PYINSTALLER_CONFIG_DIR", str(PYINSTALLER_CONFIG_DIR))
     print("Running:", " ".join(command))
-    subprocess.run(command, check=True, cwd=ROOT)
+    subprocess.run(command, check=True, cwd=ROOT, env=env)
 
     platform_slug = _platform_slug()
     zip_path = RELEASE_DIR / f"{APP_NAME}-{platform_slug}.zip"
