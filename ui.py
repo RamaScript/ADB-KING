@@ -512,6 +512,8 @@ class ADBDeviceManagerApp(QMainWindow):
         self.output_collapsed = False
         self._tables_syncing = False
         self._has_shown_adb_warning = False
+        self._responsive_layout_mode = None
+        self._main_splitter_mode = None
 
         self.tables = {}
         self.tab_indices = {}
@@ -519,7 +521,7 @@ class ADBDeviceManagerApp(QMainWindow):
 
         self.setWindowTitle("ADB Device Manager")
         self.resize(1460, 920)
-        self.setMinimumSize(1080, 720)
+        self.setMinimumSize(900, 640)
 
         self._build_ui()
         self._apply_theme("Light")
@@ -569,6 +571,9 @@ class ADBDeviceManagerApp(QMainWindow):
         left_layout.setSpacing(0)
 
         self.tab_widget = QTabWidget()
+        self.tab_widget.setUsesScrollButtons(True)
+        self.tab_widget.setElideMode(Qt.ElideRight)
+        self.tab_widget.tabBar().setExpanding(False)
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         left_layout.addWidget(self.tab_widget, 1)
         self._build_app_tabs()
@@ -593,6 +598,9 @@ class ADBDeviceManagerApp(QMainWindow):
         self.status_summary = QLabel("Ready")
         self.status_summary.setProperty("role", "muted")
         status_bar.addPermanentWidget(self.status_summary)
+
+        self._update_splitter_orientation(force=True)
+        self._update_responsive_layouts(force=True)
 
     def _build_header_card(self):
         card = self._create_card()
@@ -621,7 +629,7 @@ class ADBDeviceManagerApp(QMainWindow):
 
         self.activity_badge = QLabel("Ready")
         self.activity_badge.setAlignment(Qt.AlignCenter)
-        self.activity_badge.setMinimumWidth(116)
+        self.activity_badge.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         badge_column.addWidget(self.activity_badge, 0, Qt.AlignRight)
 
         badge_hint = QLabel("Threaded ADB tasks keep the UI responsive.")
@@ -638,40 +646,35 @@ class ADBDeviceManagerApp(QMainWindow):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
-        top_row = QHBoxLayout()
-        top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.setSpacing(10)
+        self.device_controls_grid = QGridLayout()
+        self.device_controls_grid.setContentsMargins(0, 0, 0, 0)
+        self.device_controls_grid.setHorizontalSpacing(10)
+        self.device_controls_grid.setVerticalSpacing(10)
 
-        device_label = QLabel("Device")
-        device_label.setProperty("role", "muted")
-        top_row.addWidget(device_label)
+        self.device_label = QLabel("Device")
+        self.device_label.setProperty("role", "muted")
 
         self.device_combo = QComboBox()
-        self.device_combo.setMinimumWidth(360)
+        self.device_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.device_combo.currentIndexChanged.connect(self._on_device_changed)
-        top_row.addWidget(self.device_combo, 1)
 
         self.refresh_devices_button = QPushButton("Refresh Devices")
         self.refresh_devices_button.setProperty("role", "primary")
         self.refresh_devices_button.clicked.connect(self.refresh_devices)
-        top_row.addWidget(self.refresh_devices_button)
 
         self.device_badge = QLabel("No device selected")
         self.device_badge.setAlignment(Qt.AlignCenter)
-        self.device_badge.setMinimumWidth(190)
-        top_row.addWidget(self.device_badge)
+        self.device_badge.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
 
-        theme_label = QLabel("Theme")
-        theme_label.setProperty("role", "muted")
-        top_row.addWidget(theme_label)
+        self.theme_label = QLabel("Theme")
+        self.theme_label.setProperty("role", "muted")
 
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["Light", "Dark"])
         self.theme_combo.currentTextChanged.connect(self._apply_theme)
         self.theme_combo.setMaximumWidth(120)
-        top_row.addWidget(self.theme_combo)
 
-        layout.addLayout(top_row)
+        layout.addLayout(self.device_controls_grid)
 
         self.device_hint_label = QLabel("")
         self.device_hint_label.setProperty("role", "muted")
@@ -697,34 +700,31 @@ class ADBDeviceManagerApp(QMainWindow):
         apps_header.addWidget(self.package_summary_label)
         apps_layout.addLayout(apps_header)
 
-        apps_row = QHBoxLayout()
-        apps_row.setContentsMargins(0, 0, 0, 0)
-        apps_row.setSpacing(10)
+        self.apps_controls_grid = QGridLayout()
+        self.apps_controls_grid.setContentsMargins(0, 0, 0, 0)
+        self.apps_controls_grid.setHorizontalSpacing(10)
+        self.apps_controls_grid.setVerticalSpacing(10)
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search package name")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self._refresh_package_tables)
-        apps_row.addWidget(self.search_input, 1)
 
         self.clear_search_button = QPushButton("Clear")
         self.clear_search_button.clicked.connect(self.search_input.clear)
-        apps_row.addWidget(self.clear_search_button)
 
         self.refresh_apps_button = QPushButton("Refresh Apps")
         self.refresh_apps_button.setProperty("role", "primary")
         self.refresh_apps_button.clicked.connect(self.refresh_apps)
-        apps_row.addWidget(self.refresh_apps_button)
 
         self.export_csv_button = QPushButton("CSV")
         self.export_csv_button.clicked.connect(partial(self.export_visible_packages, "csv"))
-        apps_row.addWidget(self.export_csv_button)
 
         self.export_txt_button = QPushButton("TXT")
         self.export_txt_button.clicked.connect(partial(self.export_visible_packages, "txt"))
-        apps_row.addWidget(self.export_txt_button)
+        self.package_summary_label.setWordWrap(True)
 
-        apps_layout.addLayout(apps_row)
+        apps_layout.addLayout(self.apps_controls_grid)
         layout.addWidget(self.apps_toolbar_card)
         return card
 
@@ -1010,14 +1010,97 @@ class ADBDeviceManagerApp(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._update_splitter_orientation()
+        self._update_responsive_layouts()
 
-    def _update_splitter_orientation(self):
-        if self.width() < 1260:
+    def _update_splitter_orientation(self, force=False):
+        mode = "stacked" if self.width() < 1220 else "side-by-side"
+        if not force and mode == self._main_splitter_mode:
+            return
+
+        self._main_splitter_mode = mode
+        if mode == "stacked":
             self.main_splitter.setOrientation(Qt.Vertical)
             self.main_splitter.setSizes([760, 360])
         else:
             self.main_splitter.setOrientation(Qt.Horizontal)
             self.main_splitter.setSizes([1080, 320])
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            child_layout = item.layout()
+            if child_layout is not None:
+                self._clear_layout(child_layout)
+
+    def _reset_grid_stretch(self, layout, column_count):
+        for column in range(column_count):
+            layout.setColumnStretch(column, 0)
+
+    def _update_responsive_layouts(self, force=False):
+        if self.width() < 1080:
+            mode = "compact"
+        elif self.width() < 1440:
+            mode = "medium"
+        else:
+            mode = "wide"
+
+        if not force and mode == self._responsive_layout_mode:
+            return
+
+        self._responsive_layout_mode = mode
+        self._clear_layout(self.device_controls_grid)
+        self._clear_layout(self.apps_controls_grid)
+        self._reset_grid_stretch(self.device_controls_grid, 6)
+        self._reset_grid_stretch(self.apps_controls_grid, 5)
+
+        if mode == "wide":
+            self.device_controls_grid.addWidget(self.device_label, 0, 0)
+            self.device_controls_grid.addWidget(self.device_combo, 0, 1)
+            self.device_controls_grid.addWidget(self.refresh_devices_button, 0, 2)
+            self.device_controls_grid.addWidget(self.device_badge, 0, 3)
+            self.device_controls_grid.addWidget(self.theme_label, 0, 4)
+            self.device_controls_grid.addWidget(self.theme_combo, 0, 5)
+            self.device_controls_grid.setColumnStretch(1, 1)
+
+            self.apps_controls_grid.addWidget(self.search_input, 0, 0)
+            self.apps_controls_grid.addWidget(self.clear_search_button, 0, 1)
+            self.apps_controls_grid.addWidget(self.refresh_apps_button, 0, 2)
+            self.apps_controls_grid.addWidget(self.export_csv_button, 0, 3)
+            self.apps_controls_grid.addWidget(self.export_txt_button, 0, 4)
+            self.apps_controls_grid.setColumnStretch(0, 1)
+            return
+
+        if mode == "medium":
+            self.device_controls_grid.addWidget(self.device_label, 0, 0)
+            self.device_controls_grid.addWidget(self.device_combo, 0, 1, 1, 3)
+            self.device_controls_grid.addWidget(self.refresh_devices_button, 0, 4)
+            self.device_controls_grid.addWidget(self.device_badge, 1, 0, 1, 3)
+            self.device_controls_grid.addWidget(self.theme_label, 1, 3)
+            self.device_controls_grid.addWidget(self.theme_combo, 1, 4)
+            self.device_controls_grid.setColumnStretch(1, 1)
+
+            self.apps_controls_grid.addWidget(self.search_input, 0, 0, 1, 4)
+            self.apps_controls_grid.addWidget(self.clear_search_button, 1, 0)
+            self.apps_controls_grid.addWidget(self.refresh_apps_button, 1, 1)
+            self.apps_controls_grid.addWidget(self.export_csv_button, 1, 2)
+            self.apps_controls_grid.addWidget(self.export_txt_button, 1, 3)
+            self.apps_controls_grid.setColumnStretch(0, 1)
+            return
+
+        self.device_controls_grid.addWidget(self.device_label, 0, 0)
+        self.device_controls_grid.addWidget(self.theme_label, 0, 1)
+        self.device_controls_grid.addWidget(self.device_combo, 1, 0, 1, 2)
+        self.device_controls_grid.addWidget(self.refresh_devices_button, 2, 0)
+        self.device_controls_grid.addWidget(self.theme_combo, 2, 1)
+        self.device_controls_grid.addWidget(self.device_badge, 3, 0, 1, 2)
+        self.device_controls_grid.setColumnStretch(0, 1)
+
+        self.apps_controls_grid.addWidget(self.search_input, 0, 0, 1, 2)
+        self.apps_controls_grid.addWidget(self.clear_search_button, 1, 0)
+        self.apps_controls_grid.addWidget(self.refresh_apps_button, 1, 1)
+        self.apps_controls_grid.addWidget(self.export_csv_button, 2, 0)
+        self.apps_controls_grid.addWidget(self.export_txt_button, 2, 1)
+        self.apps_controls_grid.setColumnStretch(0, 1)
 
     def _apply_theme(self, theme_name):
         if theme_name not in {"Light", "Dark"}:

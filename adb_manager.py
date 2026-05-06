@@ -12,19 +12,83 @@ import subprocess
 import platform
 import os
 import shutil
+import stat
+import sys
 from datetime import datetime
+from pathlib import Path
+
+
+def _current_platform_keys():
+    """Return platform-specific resource folder names and executable name."""
+    system = platform.system()
+    machine = platform.machine().lower()
+
+    if system == "Windows":
+        arch_key = "windows-arm64" if "arm" in machine else "windows-x64"
+        return [arch_key, "windows"], "adb.exe"
+
+    if system == "Darwin":
+        arch_key = "macos-arm64" if machine in {"arm64", "aarch64"} else "macos-x64"
+        return [arch_key, "macos"], "adb"
+
+    arch_key = "linux-arm64" if machine in {"arm64", "aarch64"} else "linux-x64"
+    return [arch_key, "linux"], "adb"
+
+
+def _runtime_search_roots():
+    """Yield directories where a bundled or sidecar adb binary may live."""
+    roots = []
+    script_dir = Path(__file__).resolve().parent
+    executable_dir = Path(sys.executable).resolve().parent
+
+    roots.append(script_dir)
+    roots.append(executable_dir)
+    roots.append(executable_dir.parent)
+    roots.append(executable_dir.parent.parent)
+
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        roots.insert(0, Path(sys._MEIPASS).resolve())
+
+    # Keep order stable while removing duplicates.
+    seen = set()
+    ordered_roots = []
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            ordered_roots.append(root)
+    return ordered_roots
+
+
+def _ensure_executable(path):
+    """Make sure bundled adb is executable on POSIX systems."""
+    if platform.system() == "Windows":
+        return
+
+    current_mode = path.stat().st_mode
+    desired_mode = current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    if desired_mode != current_mode:
+        path.chmod(desired_mode)
 
 
 def get_adb_path():
     """Return the adb executable path based on OS and availability."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if platform.system() == "Windows":
-        bundled = os.path.join(script_dir, "adb.exe")
-    else:
-        bundled = os.path.join(script_dir, "adb")
+    platform_dirs, executable_name = _current_platform_keys()
 
-    if os.path.isfile(bundled):
-        return bundled
+    candidates = []
+    for root in _runtime_search_roots():
+        candidates.append(root / executable_name)
+        for platform_dir in platform_dirs:
+            candidates.append(root / "platform-tools" / platform_dir / executable_name)
+            candidates.append(root / "resources" / "platform-tools" / platform_dir / executable_name)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            try:
+                _ensure_executable(candidate)
+            except OSError:
+                pass
+            return str(candidate)
 
     return shutil.which("adb")
 
@@ -40,7 +104,7 @@ def run_adb_command(args, timeout=30):
     if not adb:
         return (
             "",
-            "ADB not found. Please install Android Platform Tools or place adb inside the project folder.",
+            "ADB not found. Install Android Platform Tools, place adb next to the app, or bundle it under resources/platform-tools.",
             -1,
             timestamp,
         )
@@ -59,7 +123,7 @@ def run_adb_command(args, timeout=30):
     except subprocess.TimeoutExpired:
         return "", "Command timed out.", 1, timestamp
     except FileNotFoundError:
-        return "", "ADB executable not found. Please install Android Platform Tools.", -1, timestamp
+        return "", "ADB executable not found. Install Android Platform Tools or supply a bundled adb binary.", -1, timestamp
     except Exception as e:
         return "", f"Unexpected error: {e}", 1, timestamp
 
