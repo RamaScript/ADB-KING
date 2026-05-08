@@ -17,10 +17,13 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: adb-king-windows-x64
+            release_asset_name: ADB KING-windows-x64.zip
           - os: macos-15-intel
             artifact_name: adb-king-macos-x64
+            release_asset_name: ADB KING-macos-x64.zip
           - os: macos-latest
             artifact_name: adb-king-macos-arm64
+            release_asset_name: ADB KING-macos-arm64.zip
 
     steps:
       - name: Check out repository
@@ -38,6 +41,46 @@ jobs:
 
       - name: Build release asset
         run: python build_release.py
+
+      - name: Validate macOS notarization secrets
+        if: runner.os == 'macOS'
+        env:
+          APPLE_DEVELOPER_ID_APP_CERT: ${{ secrets.APPLE_DEVELOPER_ID_APP_CERT }}
+          APPLE_DEVELOPER_ID_APP_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APP_CERT_PASSWORD }}
+          APPLE_DEVELOPER_ID_APP_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APP_SIGNING_IDENTITY }}
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
+        run: |
+          missing=0
+          for key in \
+            APPLE_DEVELOPER_ID_APP_CERT \
+            APPLE_DEVELOPER_ID_APP_CERT_PASSWORD \
+            APPLE_DEVELOPER_ID_APP_SIGNING_IDENTITY \
+            APPLE_NOTARY_APPLE_ID \
+            APPLE_NOTARY_TEAM_ID \
+            APPLE_NOTARY_APP_PASSWORD
+          do
+            if [ -z "${!key}" ]; then
+              echo "::error::Missing required GitHub secret: ${key}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Sign and notarize macOS app
+        if: runner.os == 'macOS'
+        env:
+          APPLE_DEVELOPER_ID_APP_CERT: ${{ secrets.APPLE_DEVELOPER_ID_APP_CERT }}
+          APPLE_DEVELOPER_ID_APP_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APP_CERT_PASSWORD }}
+          APPLE_DEVELOPER_ID_APP_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APP_SIGNING_IDENTITY }}
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
+        run: |
+          bash scripts/notarize_macos_app.sh "dist/ADB KING.app" "release/${{ matrix.release_asset_name }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

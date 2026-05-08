@@ -59,7 +59,7 @@ QMainWindow {
 QWidget {
     background: transparent;
     color: #10233d;
-    font-family: ".SF NS Text", "Segoe UI", sans-serif;
+    font-family: "SF Pro Text", "Helvetica Neue", "Segoe UI", "Arial";
     font-size: 13px;
 }
 QLabel {
@@ -276,7 +276,7 @@ QMainWindow {
 QWidget {
     background: transparent;
     color: #e7ecf5;
-    font-family: ".SF NS Text", "Segoe UI", sans-serif;
+    font-family: "SF Pro Text", "Helvetica Neue", "Segoe UI", "Arial";
     font-size: 13px;
 }
 QLabel {
@@ -500,14 +500,21 @@ class FunctionWorker(QRunnable):
         self.task_function = task_function
         self.signals = WorkerSignals()
 
+    def _safe_emit(self, signal, *args):
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            # The window may have closed while a worker was still finishing.
+            pass
+
     def run(self):
         try:
             result = self.task_function()
-            self.signals.result.emit(result)
+            self._safe_emit(self.signals.result, result)
         except Exception:
-            self.signals.error.emit(traceback.format_exc())
+            self._safe_emit(self.signals.error, traceback.format_exc())
         finally:
-            self.signals.finished.emit()
+            self._safe_emit(self.signals.finished)
 
 
 class ADBKingApp(QMainWindow):
@@ -524,6 +531,8 @@ class ADBKingApp(QMainWindow):
         self.busy_count = 0
         self.current_theme = DEFAULT_THEME
         self.output_collapsed = False
+        self.command_input = None
+        self.run_command_button = None
         self._tables_syncing = False
         self._has_shown_adb_warning = False
         self._responsive_layout_mode = None
@@ -589,10 +598,10 @@ class ADBKingApp(QMainWindow):
         self.tab_widget.setUsesScrollButtons(True)
         self.tab_widget.setElideMode(Qt.ElideRight)
         self.tab_widget.tabBar().setExpanding(False)
-        self.tab_widget.currentChanged.connect(self._on_tab_changed)
         left_layout.addWidget(self.tab_widget, 1)
         self._build_app_tabs()
         self._build_commands_tab()
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         self.main_splitter.addWidget(self.left_panel)
         self.inspector_panel = self._build_inspector_panel()
@@ -1231,7 +1240,8 @@ class ADBKingApp(QMainWindow):
         self.refresh_apps_button.setEnabled(device_ready and not busy and current_key is not None)
         self.export_csv_button.setEnabled(device_ready and not busy and current_key is not None and bool(self.filtered_cache.get(current_key)))
         self.export_txt_button.setEnabled(device_ready and not busy and current_key is not None and bool(self.filtered_cache.get(current_key)))
-        self.run_command_button.setEnabled(device_ready and not busy and bool(self.command_input.text().strip()))
+        if self.run_command_button is not None and self.command_input is not None:
+            self.run_command_button.setEnabled(device_ready and not busy and bool(self.command_input.text().strip()))
 
         can_use_package_actions = device_ready and not busy and current_key is not None and current_package is not None
         self.copy_name_button.setEnabled(can_use_package_actions)

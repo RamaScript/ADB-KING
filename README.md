@@ -182,6 +182,32 @@ Apple docs:
 
 Without this, the app may still run, but users can see the "developer cannot be verified" warning.
 
+### GitHub Secrets for Production macOS Releases
+
+The release workflow now expects these secrets for macOS builds:
+
+- `APPLE_DEVELOPER_ID_APP_CERT`
+  Base64-encoded `.p12` export of your `Developer ID Application` certificate
+- `APPLE_DEVELOPER_ID_APP_CERT_PASSWORD`
+  Password used when exporting that `.p12`
+- `APPLE_DEVELOPER_ID_APP_SIGNING_IDENTITY`
+  Example: `Developer ID Application: Your Name (TEAMID)`
+- `APPLE_NOTARY_APPLE_ID`
+  Your Apple ID email
+- `APPLE_NOTARY_TEAM_ID`
+  Your Apple Developer team ID
+- `APPLE_NOTARY_APP_PASSWORD`
+  App-specific password for notarization
+
+Once those secrets are configured, the macOS GitHub Actions job will:
+
+1. Build the `.app`
+2. Sign it with your `Developer ID Application` certificate
+3. Submit the ZIP to Apple with `notarytool`
+4. Wait for notarization
+5. Staple the notarization ticket to the app
+6. Upload the notarized ZIP as the release asset
+
 ## Enable USB Debugging
 
 1. Open `Settings > About Phone`
