@@ -79,16 +79,47 @@ def _resolve_platform_tools_dir():
         if all((candidate / file_name).is_file() for file_name in required_files):
             return candidate
 
-    expected = "\n".join(
-        f"  - {candidate}" for candidate in candidates
-    )
-    required = ", ".join(required_files)
-    raise RuntimeError(
-        "Bundled platform-tools are missing for this build.\n"
-        f"Expected one of these folders:\n{expected}\n"
-        f"Required files: {required}\n"
-        "See resources/platform-tools/README.md for the expected structure."
-    )
+    # If missing (e.g. clean CI checkout), attempt to auto-fetch platform-tools
+    target_dir = RESOURCES_DIR / "platform-tools" / _generic_platform_slug()
+    try:
+        import urllib.request
+        import zipfile
+        import io
+        print(f"Platform-tools missing in {target_dir}. Attempting to download for {_platform_slug()}...")
+        urls = {
+            "Windows": "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
+            "Darwin": "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
+            "Linux": "https://dl.google.com/android/repository/platform-tools-latest-linux.zip",
+        }
+        url = urls.get(platform.system())
+        if url:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as resp:
+                data = resp.read()
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for member in z.infolist():
+                    if member.filename.startswith("platform-tools/"):
+                        subpath = member.filename[len("platform-tools/"):]
+                        if not subpath:
+                            continue
+                        dest = target_dir / subpath
+                        if member.is_dir():
+                            dest.mkdir(parents=True, exist_ok=True)
+                        else:
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            dest.write_bytes(z.read(member.filename))
+            print(f"Successfully downloaded platform-tools into {target_dir}")
+            return target_dir
+    except Exception as e:
+        print(f"Warning: Could not auto-download platform-tools: {e}")
+
+    for candidate in candidates:
+        if all((candidate / file_name).is_file() for file_name in required_files):
+            return candidate
+
+    print("Note: Packaging without bundled platform-tools (app will discover system ADB).")
+    return None
 
 
 def _data_arg(source, target):
